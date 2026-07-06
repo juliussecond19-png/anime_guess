@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0d0d14">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Anime Guess - Test Your Anime Knowledge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="particles" id="particles" aria-hidden="true"></div>
+
+    <header class="header">
+        <div class="header-content">
+            <h1 class="logo">
+                <span class="logo-icon">&#9889;</span>
+                <span class="logo-text">Anime Guess</span>
+            </h1>
+            <div class="header-stats">
+                <div class="stat">
+                    <span class="stat-value" id="xpDisplay">0</span>
+                    <span class="stat-label">XP</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="streakDisplay">0</span>
+                    <span class="stat-label">Streak</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="totalDisplay">0</span>
+                    <span class="stat-label">Total</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+        <div class="game-container">
+            <div class="status-banner" id="connectionStatus" hidden></div>
+
+            <div class="loading-overlay" id="loadingOverlay" aria-live="polite">
+                <div class="loader">
+                    <div class="loader-ring"></div>
+                    <div class="loader-ring"></div>
+                    <div class="loader-ring"></div>
+                    <span class="loader-text">Summoning anime...</span>
+                </div>
+            </div>
+
+            <section class="game-card" id="gameCard" aria-label="Anime guess game">
+                <div class="anime-image-container">
+                    <img id="animeImage" src="" alt="Anime screenshot" class="anime-image" loading="eager" decoding="async">
+                    <div class="image-overlay"></div>
+                </div>
+
+                <div class="question-area">
+                    <p class="question-text">Which anime is this?</p>
+                    <p class="question-subtext">Tap an option or use A, B, C, D on desktop.</p>
+                </div>
+
+                <div class="options-grid" id="optionsGrid" role="group" aria-label="Answer options"></div>
+
+                <div class="feedback-area" id="feedbackArea" aria-live="polite"></div>
+
+                <button class="btn btn-next" id="nextBtn" disabled>
+                    <span>Next Anime</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M5 12h14M12 5l7 7-7 7"/>
+                    </svg>
+                </button>
+            </section>
+
+            <div class="telegram-section">
+                <a href="https://t.me/botmorph" target="_blank" rel="noopener noreferrer" class="btn btn-telegram" id="telegramBtn">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.99 12.45l-4.14 1.43c-.31.1-.65-.09-.75-.4l-.75-2.36-2.02-1.7c-.3-.26-.31-.76-.01-1.03l2.03-1.87.8-2.53c.1-.32.51-.44.81-.24l2.91 1.22c.13.05.23.18.27.33l.59 2.12c.05.17-.04.34-.2.38zm-6.86-1.96l-1.07 3.55c-.07.24.1.48.31.52.2.04.4-.08.5-.27l1.59-5.3c.1-.33-.12-.63-.43-.67-.23-.03-.46.11-.55.29z"/>
+                    </svg>
+                    <span>Join Telegram Channel</span>
+                </a>
+            </div>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <p>Powered by <a href="https://jikan.moe/" target="_blank" rel="noopener">Jikan API</a> &bull; Built for anime fans and Telegram Mini Apps</p>
+    </footer>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
