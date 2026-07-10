@@ -15,14 +15,21 @@ const CONFIG = {
     XP_STREAK_BONUS: 50,
     MAX_STREAK_BONUS: 500,
     OPTIONS_COUNT: 4,
-    REQUEST_DELAY: 800,
+    REQUEST_DELAY: 1000,
     REQUEST_TIMEOUT: 12000,
     MAX_RETRIES: 3,
+    REQUEST_JITTER: 180,
+    RATE_LIMIT_COOLDOWN_MS: 5000,
+    SERVER_ERROR_BACKOFF_MS: 1800,
     MAX_ROUND_ATTEMPTS: 6,
     DISTRACTOR_FETCH_SIZE: 18,
     DISTRACTOR_CACHE_TARGET: 18,
     MAX_RECENT_ANIME: 12,
+    MAX_RECENT_OPTION_IDS: 24,
+    MAX_RECENT_OPTION_SETS: 8,
+    MAX_OPTION_OVERLAP: 1,
     PREFETCH_QUEUE_TARGET: 2,
+    PREFETCH_IMAGE_CANDIDATES: 2,
     PREFETCH_IDLE_DELAY: 350,
     TELEGRAM_CHANNEL: 'https://t.me/botmorph',
     STORAGE_KEYS: {
@@ -42,6 +49,8 @@ const state = {
     currentOptions: [],
     currentImageCandidates: [],
     recentAnimeIds: [],
+    recentOptionIds: [],
+    recentOptionSetSignatures: [],
     distractorCache: [],
     prefetchedRounds: [],
     isLoading: false,
@@ -50,7 +59,11 @@ const state = {
     lastRequestTime: 0,
     telegram: null,
     prefetchPromise: null,
-    prefetchScheduled: false
+    prefetchScheduled: false,
+    warmedImageUrls: new Set(),
+    requestQueue: Promise.resolve(),
+    apiCooldownUntil: 0,
+    connectionStatusTimeoutId: null
 };
 
 const elements = {
@@ -76,10 +89,19 @@ function clampRecentAnime(animeId) {
         return;
     }
 
-    state.recentAnimeIds.unshift(animeId);
-    state.recentAnimeIds = state.recentAnimeIds
-        .filter((id, index, array) => array.indexOf(id) === index)
-        .slice(0, CONFIG.MAX_RECENT_ANIME);
+    state.recentAnimeIds = pushUniqueRecent(
+        state.recentAnimeIds,
+        animeId,
+        CONFIG.MAX_RECENT_ANIME
+    );
+}
+
+function pushUniqueRecent(list, value, maxSize) {
+    if (!value) {
+        return list;
+    }
+
+    return [value, ...list.filter((item) => item !== value)].slice(0, maxSize);
 }
 
 function escapeHtml(text) {
@@ -123,6 +145,75 @@ function normalizeTitle(title) {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, ' ')
         .trim();
+}
+
+function getOptionSetSignature(options) {
+    return options
+        .map((anime) => anime?.mal_id)
+        .filter(Boolean)
+        .sort((a, b) => a - b)
+        .join(':');
+}
+
+function getRoundOptionIds(round) {
+    if (!round?.anime) {
+        return [];
+    }
+
+    return [
+        round.anime.mal_id,
+        ...(Array.isArray(round.distractors) ? round.distractors.map((anime) => anime?.mal_id) : [])
+    ].filter(Boolean);
+}
+
+function getPrefetchedOptionIds() {
+    return state.prefetchedRounds.flatMap((round) => getRoundOptionIds(round));
+}
+
+function getPrefetchedOptionSetSignatures() {
+    return state.prefetchedRounds
+        .map((round) => getOptionSetSignature([round.anime, ...(round.distractors || [])]))
+        .filter(Boolean);
+}
+
+function getReservedOptionIds(extraIds = []) {
+    return [...new Set([
+        ...state.recentOptionIds,
+        ...getPrefetchedOptionIds(),
+        ...state.currentOptions.map((anime) => anime?.mal_id),
+        state.currentAnime?.mal_id,
+        ...extraIds
+    ].filter(Boolean))];
+}
+
+function countOptionOverlap(options, recentOptionIds) {
+    const recentOptionIdSet = new Set(recentOptionIds);
+    return options.reduce((count, anime) => (
+        recentOptionIdSet.has(anime?.mal_id) ? count + 1 : count
+    ), 0);
+}
+
+function rememberRoundOptions(options) {
+    const optionIds = options
+        .map((anime) => anime?.mal_id)
+        .filter(Boolean);
+
+    optionIds.forEach((animeId) => {
+        state.recentOptionIds = pushUniqueRecent(
+            state.recentOptionIds,
+            animeId,
+            CONFIG.MAX_RECENT_OPTION_IDS
+        );
+    });
+
+    const signature = getOptionSetSignature(options);
+    if (signature) {
+        state.recentOptionSetSignatures = pushUniqueRecent(
+            state.recentOptionSetSignatures,
+            signature,
+            CONFIG.MAX_RECENT_OPTION_SETS
+        );
+    }
 }
 
 function isSafeRating(anime) {
@@ -171,66 +262,198 @@ function buildApiUrl(endpoint, params) {
     return url.toString();
 }
 
-async function rateLimitedFetch(url, options = {}) {
-    const now = Date.now();
-    const elapsed = now - state.lastRequestTime;
+function createAppError(code, userMessage, technicalMessage = userMessage) {
+    const error = new Error(technicalMessage);
+    error.code = code;
+    error.userMessage = userMessage;
+    return error;
+}
 
-    if (elapsed < CONFIG.REQUEST_DELAY) {
-        await sleep(CONFIG.REQUEST_DELAY - elapsed);
+function getUserErrorMessage(error, fallbackMessage) {
+    return error?.userMessage || fallbackMessage;
+}
+
+function getUserErrorType(error) {
+    if (error?.code === 'rate-limited' || error?.code === 'api-unavailable') {
+        return 'warning';
     }
 
-    for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt += 1) {
-        const controller = new AbortController();
-        const timeoutId = window.setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+    return 'incorrect';
+}
 
-        try {
-            state.lastRequestTime = Date.now();
+function getRetryAfterMs(headerValue) {
+    if (!headerValue) {
+        return 0;
+    }
 
-            const response = await fetch(url, {
-                ...options,
-                signal: controller.signal,
-                headers: {
-                    Accept: 'application/json',
-                    ...options.headers
-                }
-            });
+    const retryAfterSeconds = Number(headerValue);
+    if (Number.isFinite(retryAfterSeconds)) {
+        return Math.max(0, retryAfterSeconds * 1000);
+    }
 
-            if (!response.ok) {
-                if (response.status === 429 || response.status >= 500) {
-                    await sleep(attempt * 1200);
-                    continue;
-                }
+    const retryAfterDate = Date.parse(headerValue);
+    if (!Number.isNaN(retryAfterDate)) {
+        return Math.max(0, retryAfterDate - Date.now());
+    }
 
-                throw new Error(`API request failed with status ${response.status}`);
-            }
+    return 0;
+}
 
-            const payload = await response.json();
+function queueApiRequest(task) {
+    const runTask = state.requestQueue.then(task, task);
+    state.requestQueue = runTask.catch(() => undefined);
+    return runTask;
+}
 
-            if (!payload || typeof payload !== 'object' || !('data' in payload)) {
-                throw new Error('API returned an unexpected response.');
-            }
+function scheduleStatusReset(delayMs) {
+    if (state.connectionStatusTimeoutId) {
+        window.clearTimeout(state.connectionStatusTimeoutId);
+    }
 
-            return payload.data;
-        } catch (error) {
-            const isFinalAttempt = attempt === CONFIG.MAX_RETRIES;
-            const isAbort = error?.name === 'AbortError';
-            const message = isAbort
-                ? 'The request timed out. Please try again.'
-                : (error?.message || 'Unable to complete the request.');
-
-            console.warn(`Request attempt ${attempt} failed for ${url}:`, message);
-
-            if (isFinalAttempt) {
-                throw new Error(message);
-            }
-
-            await sleep(attempt * 800);
-        } finally {
-            window.clearTimeout(timeoutId);
+    state.connectionStatusTimeoutId = window.setTimeout(() => {
+        if (!state.isOffline && Date.now() >= state.apiCooldownUntil) {
+            updateConnectionStatus();
         }
+    }, delayMs);
+}
+
+function setApiCooldown(delayMs) {
+    if (!delayMs) {
+        return;
     }
 
-    throw new Error('Request failed after multiple attempts.');
+    const cooldownMs = Math.max(delayMs, CONFIG.RATE_LIMIT_COOLDOWN_MS);
+    state.apiCooldownUntil = Math.max(state.apiCooldownUntil, Date.now() + cooldownMs);
+
+    if (!state.isOffline) {
+        setConnectionStatus('Anime service is a little busy. We will keep loading gently.', 'info');
+        scheduleStatusReset(cooldownMs + 250);
+    }
+}
+
+async function waitForApiTurn() {
+    const now = Date.now();
+    const requestWait = Math.max(0, (state.lastRequestTime + CONFIG.REQUEST_DELAY) - now);
+    const cooldownWait = Math.max(0, state.apiCooldownUntil - now);
+    const waitTime = Math.max(requestWait, cooldownWait);
+
+    if (waitTime > 0) {
+        const jitter = Math.floor(Math.random() * CONFIG.REQUEST_JITTER);
+        await sleep(waitTime + jitter);
+    }
+}
+
+async function rateLimitedFetch(url, options = {}) {
+    return queueApiRequest(async () => {
+        for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt += 1) {
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+
+            try {
+                await waitForApiTurn();
+                state.lastRequestTime = Date.now();
+
+                const response = await fetch(url, {
+                    ...options,
+                    signal: controller.signal,
+                    headers: {
+                        Accept: 'application/json',
+                        ...options.headers
+                    }
+                });
+
+                if (!response.ok) {
+                    if (response.status === 429) {
+                        const retryAfterMs = getRetryAfterMs(response.headers.get('Retry-After'));
+                        const backoffMs = Math.max(
+                            retryAfterMs,
+                            CONFIG.RATE_LIMIT_COOLDOWN_MS * attempt
+                        );
+
+                        setApiCooldown(backoffMs);
+                        console.warn(`Request attempt ${attempt} hit rate limit for ${url}.`);
+
+                        if (attempt === CONFIG.MAX_RETRIES) {
+                            throw createAppError(
+                                'rate-limited',
+                                'Anime service is busy right now. Please try again in a few seconds.',
+                                `API request was rate limited with status 429 for ${url}`
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    if (response.status >= 500) {
+                        const backoffMs = CONFIG.SERVER_ERROR_BACKOFF_MS * attempt;
+                        setApiCooldown(backoffMs);
+                        console.warn(`Request attempt ${attempt} hit server error ${response.status} for ${url}.`);
+
+                        if (attempt === CONFIG.MAX_RETRIES) {
+                            throw createAppError(
+                                'api-unavailable',
+                                'Anime service is having a moment. Please try again shortly.',
+                                `API request failed with status ${response.status} for ${url}`
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    throw createAppError(
+                        'api-error',
+                        'We could not load that anime data cleanly. Please try another round.',
+                        `API request failed with status ${response.status} for ${url}`
+                    );
+                }
+
+                const payload = await response.json();
+
+                if (!payload || typeof payload !== 'object' || !('data' in payload)) {
+                    throw createAppError(
+                        'bad-response',
+                        'Anime data came back in an unexpected format. Please try again.',
+                        'API returned an unexpected response.'
+                    );
+                }
+
+                if (!state.isOffline && Date.now() >= state.apiCooldownUntil) {
+                    updateConnectionStatus();
+                }
+
+                return payload.data;
+            } catch (error) {
+                const isFinalAttempt = attempt === CONFIG.MAX_RETRIES;
+                const isAbort = error?.name === 'AbortError';
+                const isAppError = Boolean(error?.userMessage);
+                const userMessage = isAbort
+                    ? 'The anime service took too long to answer. Please try again.'
+                    : getUserErrorMessage(error, 'We could not reach the anime service right now.');
+
+                console.warn(`Request attempt ${attempt} failed for ${url}:`, error?.message || userMessage);
+
+                if (isFinalAttempt || isAppError) {
+                    if (isAbort) {
+                        throw createAppError('timeout', userMessage, error?.message || userMessage);
+                    }
+
+                    throw (isAppError
+                        ? error
+                        : createAppError('network-error', userMessage, error?.message || userMessage));
+                }
+
+                await sleep((CONFIG.SERVER_ERROR_BACKOFF_MS / 2) * attempt);
+            } finally {
+                window.clearTimeout(timeoutId);
+            }
+        }
+
+        throw createAppError(
+            'request-failed',
+            'We could not load anime data right now. Please try again.',
+            'Request failed after multiple attempts.'
+        );
+    });
 }
 
 async function fetchRandomAnime() {
@@ -251,7 +474,7 @@ async function fetchAnimePictures(animeId) {
 async function fetchDistractorBatch(excludeIds = []) {
     const orderByOptions = ['popularity', 'score', 'members'];
     const orderBy = orderByOptions[Math.floor(Math.random() * orderByOptions.length)];
-    const page = Math.floor(Math.random() * 8) + 1;
+    const page = Math.floor(Math.random() * 12) + 1;
     const params = {
         page,
         limit: CONFIG.DISTRACTOR_FETCH_SIZE,
@@ -358,23 +581,34 @@ async function ensureDistractorCache(excludeIds = [], needed = CONFIG.OPTIONS_CO
 
 async function selectDistractors(correctAnime, count = CONFIG.OPTIONS_COUNT - 1) {
     const excludeIds = [correctAnime.mal_id];
-    await ensureDistractorCache(excludeIds, count);
+    const avoidOptionIds = new Set(getReservedOptionIds(excludeIds));
+    await ensureDistractorCache(excludeIds, count * 2);
 
     const usedTitles = new Set([normalizeTitle(getPrimaryTitle(correctAnime))]);
     const selected = [];
+    const candidatePools = [
+        shuffleArray(state.distractorCache).filter((anime) => !avoidOptionIds.has(anime.mal_id)),
+        shuffleArray(state.distractorCache)
+    ];
 
-    for (const anime of shuffleArray(state.distractorCache)) {
-        const titleKey = normalizeTitle(getPrimaryTitle(anime));
-        if (
-            anime.mal_id === correctAnime.mal_id ||
-            usedTitles.has(titleKey) ||
-            selected.some((item) => item.mal_id === anime.mal_id)
-        ) {
-            continue;
+    for (const pool of candidatePools) {
+        for (const anime of pool) {
+            const titleKey = normalizeTitle(getPrimaryTitle(anime));
+            if (
+                anime.mal_id === correctAnime.mal_id ||
+                usedTitles.has(titleKey) ||
+                selected.some((item) => item.mal_id === anime.mal_id)
+            ) {
+                continue;
+            }
+
+            usedTitles.add(titleKey);
+            selected.push(anime);
+
+            if (selected.length >= count) {
+                break;
+            }
         }
-
-        usedTitles.add(titleKey);
-        selected.push(anime);
 
         if (selected.length >= count) {
             break;
@@ -531,14 +765,20 @@ function clearRoundUi() {
 }
 
 function warmRoundImage(round) {
-    const previewUrl = round?.imageCandidates?.[0];
-    if (!previewUrl) {
-        return;
-    }
+    const previewUrls = Array.isArray(round?.imageCandidates)
+        ? round.imageCandidates.slice(0, CONFIG.PREFETCH_IMAGE_CANDIDATES)
+        : [];
 
-    const image = new Image();
-    image.decoding = 'async';
-    image.src = previewUrl;
+    previewUrls.forEach((previewUrl) => {
+        if (!previewUrl || state.warmedImageUrls.has(previewUrl)) {
+            return;
+        }
+
+        state.warmedImageUrls.add(previewUrl);
+        const image = new Image();
+        image.decoding = 'async';
+        image.src = previewUrl;
+    });
 }
 
 function renderInlineMessage({ type = 'info', text, actionLabel, onAction }) {
@@ -585,6 +825,7 @@ function createOptionButton(anime, index, isCorrect) {
 function displayOptions(anime, distractors) {
     const options = shuffleArray([...distractors.slice(0, CONFIG.OPTIONS_COUNT - 1), anime]);
     state.currentOptions = options;
+    rememberRoundOptions(options);
 
     if (!elements.optionsGrid) {
         return;
@@ -765,6 +1006,12 @@ async function loadImageWithFallback(imageCandidates, altText) {
 
 async function buildRound() {
     const excludedIds = getExcludedAnimeIds();
+    const reservedOptionIds = getReservedOptionIds(excludedIds);
+    const existingSignatures = new Set([
+        ...state.recentOptionSetSignatures,
+        ...getPrefetchedOptionSetSignatures()
+    ]);
+    let lastError = null;
 
     for (let attempt = 1; attempt <= CONFIG.MAX_ROUND_ATTEMPTS; attempt += 1) {
         try {
@@ -781,17 +1028,36 @@ async function buildRound() {
             }
 
             const distractors = await selectDistractors(anime);
+            const roundOptions = [anime, ...distractors];
+            const optionSignature = getOptionSetSignature(roundOptions);
+            const overlapCount = countOptionOverlap(roundOptions, reservedOptionIds);
+
+            if (
+                existingSignatures.has(optionSignature) ||
+                overlapCount > CONFIG.MAX_OPTION_OVERLAP
+            ) {
+                continue;
+            }
+
             return {
                 anime,
                 distractors,
                 imageCandidates
             };
         } catch (error) {
+            lastError = error;
             console.warn(`Round attempt ${attempt} failed:`, error.message);
         }
     }
 
-    throw new Error('Unable to build a playable round right now.');
+    throw createAppError(
+        lastError?.code || 'round-unavailable',
+        getUserErrorMessage(
+            lastError,
+            'We could not prepare a fresh anime round right now. Please try again in a moment.'
+        ),
+        lastError?.message || 'Unable to build a playable round right now.'
+    );
 }
 
 async function fillPrefetchQueue() {
@@ -887,6 +1153,7 @@ async function loadNextAnime() {
     try {
         const round = await getNextRound();
         state.currentAnime = round.anime;
+        state.currentOptions = [round.anime, ...(round.distractors || [])];
         state.currentImageCandidates = round.imageCandidates;
 
         await loadImageWithFallback(
@@ -898,9 +1165,13 @@ async function loadNextAnime() {
         clampRecentAnime(round.anime.mal_id);
     } catch (error) {
         console.error('Failed to load next anime round:', error);
+        state.currentOptions = [];
         renderInlineMessage({
-            type: 'incorrect',
-            text: error.message || 'Failed to load anime. Please try again.',
+            type: getUserErrorType(error),
+            text: getUserErrorMessage(
+                error,
+                'We could not load the next anime yet. Please try again.'
+            ),
             actionLabel: 'Try Again',
             onAction: () => {
                 if (!state.isLoading) {
